@@ -1,5 +1,6 @@
 """Q13 (queue == ability), Q10/Q11 (explanations, history) and the HTTP layer."""
 import json
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -7,7 +8,7 @@ from fastapi.testclient import TestClient
 from app import main
 from app import policy as P
 from app import service as S
-from app.db import shift
+from app.db import connect, shift
 
 
 # --------------------------------------------------------------- Q13 parity
@@ -142,6 +143,67 @@ def test_api_self_grant_refused(client):
     r = client.post("/grants", headers=H("anita"),
                     json=dict(user_id="anita", role_id="maker", reason="I would like to help out"))
     assert r.status_code == 403 and "themselves" in r.json()["error"]
+
+
+def test_denied_privilege_escalation_is_audited(client, db_file):
+    r = client.post("/grants", headers=H("anita"),
+                    json=dict(user_id="anita", role_id="maker", reason="I would like to help out"))
+    assert r.status_code == 403
+    conn = connect(db_file)
+    try:
+        row = conn.execute(
+            "SELECT actor_id, action, target_type, target_id, detail FROM access_events "
+            "WHERE action='access_denied' ORDER BY id DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    assert row["actor_id"] == "anita"
+    assert row["target_type"] == "access_attempt" and row["target_id"] == "anita"
+    assert json.loads(row["detail"])["operation"] == "grant"
+
+
+def test_access_directory_requires_access_read(client, db_file):
+    assert client.get("/roles", headers=H("priya")).status_code == 403
+    assert client.get("/users", headers=H("priya")).status_code == 403
+    assert client.get("/users/rahul/access", headers=H("priya")).status_code == 403
+    assert client.get("/users/priya/access", headers=H("priya")).status_code == 200
+    assert client.get("/roles", headers=H("tarun")).status_code == 200
+    assert client.get("/users", headers=H("tarun")).status_code == 200
+
+    conn = connect(db_file)
+    try:
+        conn.execute("UPDATE users SET deactivated_at=? WHERE id='tarun'", ("2026-11-03T09:00:00Z",))
+    finally:
+        conn.close()
+    assert client.get("/audit", headers=H("tarun")).status_code == 403
+
+
+def test_authorization_storage_unavailable_fails_closed(client, db_file, monkeypatch):
+    def unavailable(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    conn = connect(db_file)
+    try:
+        before = conn.execute("SELECT stage FROM jobs WHERE id='J000001'").fetchone()[0]
+        before_logs = conn.execute(
+            "SELECT COUNT(*) FROM decision_log WHERE job_id='J000001' AND user_id='sneha' "
+            "AND action='check' AND allowed=1").fetchone()[0]
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(S, "_save_job", unavailable)
+    r = client.post("/jobs/J000001/actions/check", headers=H("sneha"), json={})
+    assert r.status_code == 503
+    assert "verify write state before retrying" in r.json()["error"]
+
+    conn = connect(db_file)
+    try:
+        after = conn.execute("SELECT stage FROM jobs WHERE id='J000001'").fetchone()[0]
+        after_logs = conn.execute(
+            "SELECT COUNT(*) FROM decision_log WHERE job_id='J000001' AND user_id='sneha' "
+            "AND action='check' AND allowed=1").fetchone()[0]
+    finally:
+        conn.close()
+    assert after == before and after_logs == before_logs
 
 
 def test_api_plain_english_access(client):

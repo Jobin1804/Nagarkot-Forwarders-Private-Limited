@@ -1,5 +1,6 @@
 """Edge cases from the brief, one test (or a few) per question."""
 import itertools
+import sqlite3
 
 import pytest
 
@@ -297,8 +298,19 @@ def test_admin_cannot_grow_a_role_they_hold_alone(conn, now):
     assert "job.edit" not in r["permissions_now"]
     with pytest.raises(S.Denied):
         S.approve_role_version(conn, "anita", "admin", 2, t(now, 1))
+    denial = conn.execute(
+        "SELECT detail FROM access_events WHERE action='access_denied' ORDER BY id DESC LIMIT 1").fetchone()
+    assert denial and '"operation": "role_approval"' in denial["detail"]
     with pytest.raises(S.Denied):     # a filed job stays out of reach whatever happens
         S.edit_job(conn, "anita", "J000003", {"data": {"x": 1}}, t(now, 2))
+
+
+def test_audit_events_are_append_only(conn):
+    for table in ("job_events", "access_events", "decision_log"):
+        row = conn.execute(f"SELECT id FROM {table} ORDER BY id LIMIT 1").fetchone()
+        assert row
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute(f"DELETE FROM {table} WHERE id=?", (row["id"],))
 
 
 def test_admin_cannot_do_customs_work(conn, now):

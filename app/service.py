@@ -83,6 +83,14 @@ def access_event(conn, at, actor, action, target_type, target_id, detail=None):
                  (at, actor, action, target_type, str(target_id), dumps(detail or {})))
 
 
+def _deny_access_change(conn, actor, now, operation, reason, detail=None):
+    err = Denied(reason)
+    err.after_rollback = lambda c: access_event(
+        c, now, actor, "access_denied", "access_attempt", actor,
+        {"operation": operation, "reason": reason, **(detail or {})})
+    raise err
+
+
 def _snapshot(job) -> str:
     s = dict(job)
     if isinstance(s.get("data"), str):
@@ -432,17 +440,20 @@ def _actor_grant_scopes(conn, actor, perm, now):
     return [g for g in P.grants_at(conn, actor, now) if perm in g["permissions"]]
 
 
-def _require_access_perm(conn, actor, perm, now, scope=None):
+def _require_access_perm(conn, actor, perm, now, scope=None, operation="access_change", detail=None):
     user = P.get_user(conn, actor)
     if not P.user_active(user, now) or user["kind"] != "staff":
-        raise Denied(f"{actor} is not an active staff account")
+        _deny_access_change(conn, actor, now, operation, f"{actor} is not an active staff account", detail)
     held = _actor_grant_scopes(conn, actor, perm, now)
     if not held:
-        raise Denied(f"{actor} does not hold {perm}")
+        _deny_access_change(conn, actor, now, operation, f"{actor} does not hold {perm}",
+                            {"permission": perm, **(detail or {})})
     if scope is not None and not any(P.scope_covers(g, scope) for g in held):
-        raise Denied(f"{actor} holds {perm} only for "
-                     + "; ".join(P.describe_scope(g) for g in held)
-                     + f", which does not cover {P.describe_scope(scope)}")
+        reason = (f"{actor} holds {perm} only for "
+                  + "; ".join(P.describe_scope(g) for g in held)
+                  + f", which does not cover {P.describe_scope(scope)}")
+        _deny_access_change(conn, actor, now, operation, reason,
+                            {"permission": perm, "scope": scope, **(detail or {})})
     return held
 
 
@@ -461,9 +472,12 @@ def create_grant(conn, actor, spec, now) -> dict:
                 raise BadRequest(f"{target['id']} works for client {target['client_id']}; "
                                  f"they can only ever be given access to that client")
             scope["client_id"] = target["client_id"]
-        _require_access_perm(conn, actor, "access.grant", now, scope)
+        target_detail = {"user_id": target["id"], "role_id": role["id"], "scope": scope}
+        _require_access_perm(conn, actor, "access.grant", now, scope, "grant", target_detail)
         if actor == target["id"]:
-            raise Denied("nobody may grant access to themselves; ask another administrator")
+            _deny_access_change(conn, actor, now, "grant",
+                                "nobody may grant access to themselves; ask another administrator",
+                                target_detail)
         if role["audience"] != target["kind"]:
             raise BadRequest(f"role {role['id']} is for {role['audience']} accounts; "
                              f"{target['id']} is a {target['kind']} account")
@@ -511,9 +525,13 @@ def approve_grant(conn, actor, gid, now, approve=True) -> dict:
         g = get_grant(conn, gid)
         if g["status"] != "pending":
             raise Conflict(f"grant is {g['status']}, not pending")
-        _require_access_perm(conn, actor, "access.grant", now, g)
+        grant_detail = {"grant_id": gid, "user_id": g["user_id"], "role_id": g["role_id"]}
+        _require_access_perm(conn, actor, "access.grant", now, g, "grant_approval", grant_detail)
         if actor in (g["granted_by"], g["user_id"]):
-            raise Denied("a privileged grant must be approved by someone other than the granter and the grantee")
+            _deny_access_change(
+                conn, actor, now, "grant_approval",
+                "a privileged grant must be approved by someone other than the granter and the grantee",
+                grant_detail)
         if approve:
             conn.execute("UPDATE grants SET status='active', approved_by=?, effective_from=? WHERE id=?",
                          (actor, max(g["valid_from"], now), gid))
@@ -530,7 +548,8 @@ def revoke_grant(conn, actor, gid, reason, now) -> dict:
         if g["status"] not in ("active", "pending"):
             raise Conflict(f"grant is already {g['status']}")
         if actor != g["user_id"]:  # giving up your own access is always allowed
-            _require_access_perm(conn, actor, "access.grant", now, g)
+            _require_access_perm(conn, actor, "access.grant", now, g, "grant_revoke",
+                                 {"grant_id": gid, "user_id": g["user_id"], "role_id": g["role_id"]})
         reason = _require_reason(reason, "Revoking access")
         conn.execute("UPDATE grants SET status='revoked', revoked_at=?, revoked_by=?, revoke_reason=? WHERE id=?",
                      (now, actor, reason, gid))
@@ -598,7 +617,8 @@ def _validate_role_perms(perms, audience):
 def create_role(conn, actor, spec, now) -> dict:
     """New roles are data: no deploy needed. Privileged roles wait for a second admin."""
     with tx(conn):
-        _require_access_perm(conn, actor, "access.role_manage", now)
+        _require_access_perm(conn, actor, "access.role_manage", now, operation="role_create",
+                             detail={"role_id": spec.get("id")})
         rid = (spec.get("id") or "").strip().lower()
         if not rid or not rid.replace("_", "").replace("-", "").isalnum():
             raise BadRequest("role id must be a short slug like 'senior_checker'")
@@ -627,7 +647,8 @@ def update_role(conn, actor, rid, permissions, reason, now) -> dict:
     Needs a second admin if the role is (or becomes) privileged, or if the editor
     holds the role themselves (that would be self-escalation by the back door)."""
     with tx(conn):
-        _require_access_perm(conn, actor, "access.role_manage", now)
+        _require_access_perm(conn, actor, "access.role_manage", now, operation="role_update",
+                             detail={"role_id": rid})
         role = row_dict(conn.execute("SELECT * FROM roles WHERE id=?", (rid,)).fetchone())
         if role is None:
             raise NotFound(f"role {rid} not found")
@@ -654,14 +675,17 @@ def update_role(conn, actor, rid, permissions, reason, now) -> dict:
 
 def approve_role_version(conn, actor, rid, version, now, approve=True) -> dict:
     with tx(conn):
-        _require_access_perm(conn, actor, "access.role_manage", now)
+        _require_access_perm(conn, actor, "access.role_manage", now, operation="role_approval",
+                             detail={"role_id": rid, "version": version})
         rv = row_dict(conn.execute("SELECT * FROM role_versions WHERE role_id=? AND version=?", (rid, version)).fetchone())
         if rv is None:
             raise NotFound("role version not found")
         if rv["status"] != "pending":
             raise Conflict(f"version is {rv['status']}")
         if rv["changed_by"] == actor:
-            raise Denied("a role change must be approved by someone other than the person who made it")
+            _deny_access_change(conn, actor, now, "role_approval",
+                                "a role change must be approved by someone other than the person who made it",
+                                {"role_id": rid, "version": version})
         conn.execute("UPDATE role_versions SET status=?, approved_by=?, effective_from=? WHERE role_id=? AND version=?",
                      ("active" if approve else "rejected", actor, now if approve else None, rid, version))
         access_event(conn, now, actor, "role_version_approved" if approve else "role_version_rejected", "role", rid,
@@ -690,7 +714,8 @@ def set_absence(conn, actor, spec, now) -> dict:
         if user is None or user["kind"] != "staff":
             raise BadRequest("absences are recorded for staff accounts")
         if actor != uid:
-            _require_access_perm(conn, actor, "access.absence_manage", now)
+            _require_access_perm(conn, actor, "access.absence_manage", now, operation="absence_record",
+                                 detail={"user_id": uid})
         starts = norm_ts(spec.get("starts_at")) or now
         ends = norm_ts(spec.get("ends_at"))
         if not ends or ends <= starts:
@@ -723,7 +748,8 @@ def end_absence(conn, actor, absence_id, now) -> dict:
         if a is None:
             raise NotFound("absence not found")
         if actor != a["user_id"]:
-            _require_access_perm(conn, actor, "access.absence_manage", now)
+            _require_access_perm(conn, actor, "access.absence_manage", now, operation="absence_end",
+                                 detail={"absence_id": absence_id, "user_id": a["user_id"]})
         conn.execute("UPDATE absences SET ends_at=? WHERE id=? AND ends_at > ?", (now, absence_id, now))
         access_event(conn, now, actor, "absence_ended", "user", a["user_id"], {"absence_id": absence_id})
     return row_dict(conn.execute("SELECT * FROM absences WHERE id=?", (absence_id,)).fetchone())

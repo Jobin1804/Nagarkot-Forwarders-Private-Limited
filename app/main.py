@@ -7,6 +7,8 @@ revocation takes effect on the very next request.
 """
 from __future__ import annotations
 
+import logging
+import sqlite3
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Header, Query, Request
@@ -19,6 +21,7 @@ from .db import connect, init_schema, norm_ts, parse_ts, shift, utcnow, iso
 
 app = FastAPI(title="NFPL Access Control Service", version="1.0",
               description="Decides who may do what on which job, explains why, and remembers.")
+logger = logging.getLogger(__name__)
 
 _DB_PATH: Optional[str] = None
 
@@ -52,9 +55,18 @@ def _service_error(_req: Request, exc: S.ServiceError):
 
 @app.exception_handler(Exception)
 def _unexpected(_req: Request, exc: Exception):
-    # Q14: when the system itself is unsure (a bug, a missing row), it refuses.
+    logger.exception("Unexpected authorization service failure")
     return JSONResponse(status_code=500, content={
-        "error": "internal error; nothing was changed (the service fails closed)", "type": type(exc).__name__})
+        "error": "internal error; request could not be completed; verify write state before retrying",
+        "type": type(exc).__name__})
+
+
+@app.exception_handler(sqlite3.OperationalError)
+def _database_unavailable(_req: Request, exc: sqlite3.OperationalError):
+    logger.exception("Authorization storage is unavailable")
+    return JSONResponse(status_code=503, content={
+        "error": "authorization storage is unavailable; request could not be completed; "
+                 "verify write state before retrying"})
 
 
 # ------------------------------------------------------------------- models
@@ -151,18 +163,24 @@ def permissions():
 
 
 @app.get("/roles")
-def list_roles(conn=Depends(get_conn), _u: str = Depends(caller)):
+def list_roles(conn=Depends(get_conn), me: str = Depends(caller)):
+    _require_auditor(conn, me)
     now = utcnow()
     return [S.get_role(conn, r[0], now) for r in conn.execute("SELECT id FROM roles ORDER BY id")]
 
 
 @app.get("/users")
-def list_users(conn=Depends(get_conn), _u: str = Depends(caller)):
+def list_users(conn=Depends(get_conn), me: str = Depends(caller)):
+    _require_auditor(conn, me)
     return [dict(r) for r in conn.execute("SELECT * FROM users ORDER BY id")]
 
 
 @app.get("/users/{user_id}/access")
-def user_access(user_id: str, at: Optional[str] = None, conn=Depends(get_conn), _u: str = Depends(caller)):
+def user_access(user_id: str, at: Optional[str] = None, conn=Depends(get_conn), me: str = Depends(caller)):
+    if me != user_id:
+        _require_auditor(conn, me)
+    elif not P.user_active(P.get_user(conn, me), utcnow()):
+        raise S.Denied("inactive accounts cannot read access details")
     return S.describe_access(conn, user_id, clock(at))
 
 
@@ -249,7 +267,11 @@ def who_could(job_id: str, date: Optional[str] = None, start: Optional[str] = No
 
 
 def _require_auditor(conn, me):
-    if not any("access.read" in g["permissions"] for g in P.grants_at(conn, me, utcnow())):
+    now = utcnow()
+    user = P.get_user(conn, me)
+    if not P.user_active(user, now) or user["kind"] != "staff":
+        raise S.Denied(f"{me} is not an active staff account")
+    if not any("access.read" in g["permissions"] for g in P.grants_at(conn, me, now)):
         raise S.Denied(f"{me} does not hold access.read (needed for audit questions)")
 
 
@@ -283,6 +305,8 @@ def my_approvals(conn=Depends(get_conn), me: str = Depends(caller)):
 
 @app.get("/me/access")
 def my_access(conn=Depends(get_conn), me: str = Depends(caller)):
+    if not P.user_active(P.get_user(conn, me), utcnow()):
+        raise S.Denied("inactive accounts cannot read access details")
     return S.describe_access(conn, me, utcnow())
 
 
@@ -364,6 +388,6 @@ def audit(target_type: Optional[str] = None, target_id: Optional[str] = None, li
 @app.post("/parser/sync")
 def parser_sync(body: SyncBody, conn=Depends(get_conn), me: str = Depends(caller)):
     user = P.get_user(conn, me)
-    if user is None or user["kind"] != "service":
-        raise S.Denied("only the parser's service account may call the feed endpoint")
+    if not P.user_active(user, utcnow()) or user["kind"] != "service":
+        raise S.Denied("only an active parser service account may call the feed endpoint")
     return S.parser_sync(conn, me, body.items, utcnow(), body.run_id)

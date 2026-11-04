@@ -37,6 +37,8 @@ curl -H "X-User: tarun" "localhost:8000/explain/compare?users=sneha,rahul&action
 curl -H "X-User: tarun" "localhost:8000/jobs/J000003/who-could?date=2026-10-03"
 ```
 
+**Security boundary:** `X-User` is only a local-assignment/demo identity stub, not authentication. Do not expose this service to a network or use it for real shipment data until the header is supplied by a trusted SSO integration. Job, access-change, and decision audit tables reject updates and deletes; denied access-management attempts are recorded too. If SQLite is unavailable, the API fails closed with HTTP 503; verify the result of a write before retrying after any server error.
+
 Or play every scenario automatically, with no server (uses its own copy of the data):
 
 ```bash

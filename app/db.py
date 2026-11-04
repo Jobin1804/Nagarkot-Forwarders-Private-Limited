@@ -144,6 +144,10 @@ CREATE TABLE IF NOT EXISTS job_events (
     snapshot   TEXT NOT NULL                    -- JSON
 );
 CREATE INDEX IF NOT EXISTS ix_job_events_job ON job_events(job_id, at);
+CREATE TRIGGER IF NOT EXISTS job_events_no_update
+BEFORE UPDATE ON job_events BEGIN SELECT RAISE(ABORT, 'job_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS job_events_no_delete
+BEFORE DELETE ON job_events BEGIN SELECT RAISE(ABORT, 'job_events is append-only'); END;
 
 -- Two-person workflow for cancelling a filed job or reopening a closed one.
 CREATE TABLE IF NOT EXISTS requests (
@@ -171,6 +175,10 @@ CREATE TABLE IF NOT EXISTS access_events (
     detail      TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_access_events_target ON access_events(target_type, target_id);
+CREATE TRIGGER IF NOT EXISTS access_events_no_update
+BEFORE UPDATE ON access_events BEGIN SELECT RAISE(ABORT, 'access_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS access_events_no_delete
+BEFORE DELETE ON access_events BEGIN SELECT RAISE(ABORT, 'access_events is append-only'); END;
 
 -- Every attempt to change something, allowed or denied, with its explanation.
 CREATE TABLE IF NOT EXISTS decision_log (
@@ -183,6 +191,10 @@ CREATE TABLE IF NOT EXISTS decision_log (
     summary  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_decision_log_job ON decision_log(job_id, at);
+CREATE TRIGGER IF NOT EXISTS decision_log_no_update
+BEFORE UPDATE ON decision_log BEGIN SELECT RAISE(ABORT, 'decision_log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS decision_log_no_delete
+BEFORE DELETE ON decision_log BEGIN SELECT RAISE(ABORT, 'decision_log is append-only'); END;
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
